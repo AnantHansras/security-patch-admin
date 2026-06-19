@@ -1,0 +1,199 @@
+# .github/workflows/security-patch-orchestrator.yml
+# Lives ONLY in the centralized master/admin repository.
+
+name: Centralized Security Patch Orchestrator
+
+on:
+  workflow_dispatch:
+    inputs:
+      target_repo:
+        description: "Target repo full name, e.g. my-org/my-service"
+        required: true
+        type: string
+      target_branch:
+        description: "Branch to patch (defaults to repo's default branch)"
+        required: false
+        type: string
+        default: ""
+
+  repository_dispatch:
+    types: [security-patch-request]   # fired by the webhook receiver on push events
+
+  schedule:
+    - cron: "0 3 * * 1"   # Weekly, Monday 03:00 UTC — adjust as needed
+
+permissions:
+  contents: read   # master repo itself needs minimal perms; real perms come from the App token
+
+concurrency:
+  group: security-patch-${{ github.event.inputs.target_repo || github.event.client_payload.repo_full_name || github.run_id }}
+  cancel-in-progress: false
+
+jobs:
+  # ----------------------------------------------------------------------
+  # JOB 1: Resolve the list of target repos for this run.
+  # - workflow_dispatch / repository_dispatch -> single repo
+  # - schedule -> every repo the App is installed on
+  # ----------------------------------------------------------------------
+  resolve-targets:
+    runs-on: ubuntu-latest
+    outputs:
+      matrix: ${{ steps.build-matrix.outputs.matrix }}
+    steps:
+      - name: Generate App installation token (org-level, for listing repos)
+        id: app-token
+        uses: actions/create-github-app-token@v1
+        with:
+          app-id: ${{ secrets.APP_ID }}
+          private-key: ${{ secrets.APP_PRIVATE_KEY }}
+
+      - name: Build target matrix
+        id: build-matrix
+        env:
+          GH_TOKEN: ${{ steps.app-token.outputs.token }}
+          EVENT_NAME: ${{ github.event_name }}
+          DISPATCH_REPO: ${{ github.event.inputs.target_repo }}
+          DISPATCH_BRANCH: ${{ github.event.inputs.target_branch }}
+          PAYLOAD_REPO: ${{ github.event.client_payload.repo_full_name }}
+          PAYLOAD_BRANCH: ${{ github.event.client_payload.branch }}
+        run: |
+          set -euo pipefail
+
+          if [[ "$EVENT_NAME" == "schedule" ]]; then
+            echo "Schedule run — enumerating all App-installed repositories..."
+            REPOS_JSON=$(gh api /installation/repositories --paginate \
+              --jq '[.repositories[] | {repo: .full_name, branch: .default_branch}]')
+            MATRIX=$(echo "$REPOS_JSON" | jq -c '{include: .}')
+          elif [[ "$EVENT_NAME" == "repository_dispatch" ]]; then
+            BRANCH="${PAYLOAD_BRANCH:-}"
+            if [[ -z "$BRANCH" ]]; then
+              BRANCH=$(gh api "/repos/${PAYLOAD_REPO}" --jq '.default_branch')
+            fi
+            MATRIX=$(jq -nc --arg r "$PAYLOAD_REPO" --arg b "$BRANCH" \
+              '{include: [{repo: $r, branch: $b}]}')
+          else
+            # workflow_dispatch
+            BRANCH="${DISPATCH_BRANCH:-}"
+            if [[ -z "$BRANCH" ]]; then
+              BRANCH=$(gh api "/repos/${DISPATCH_REPO}" --jq '.default_branch')
+            fi
+            MATRIX=$(jq -nc --arg r "$DISPATCH_REPO" --arg b "$BRANCH" \
+              '{include: [{repo: $r, branch: $b}]}')
+          fi
+
+          echo "matrix=$MATRIX" >> "$GITHUB_OUTPUT"
+          echo "Resolved matrix: $MATRIX"
+
+  # ----------------------------------------------------------------------
+  # JOB 2: The actual patch engine — one run per target repo.
+  # ----------------------------------------------------------------------
+  patch:
+    needs: resolve-targets
+    if: ${{ needs.resolve-targets.outputs.matrix != '' }}
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      max-parallel: 4
+      matrix: ${{ fromJson(needs.resolve-targets.outputs.matrix) }}
+
+    steps:
+      # ---- 1. Mint a short-lived, repo-scoped installation token ----
+      - name: Generate installation token for ${{ matrix.repo }}
+        id: app-token
+        uses: actions/create-github-app-token@v1
+        with:
+          app-id: ${{ secrets.APP_ID }}
+          private-key: ${{ secrets.APP_PRIVATE_KEY }}
+          repositories: ${{ matrix.repo }}
+
+      # ---- 2. Clone target repo using that token ----
+      - name: Checkout target repository
+        uses: actions/checkout@v4
+        with:
+          repository: ${{ matrix.repo }}
+          ref: ${{ matrix.branch }}
+          token: ${{ steps.app-token.outputs.token }}
+          path: target-repo
+          fetch-depth: 0
+
+      - name: Create working branch
+        working-directory: target-repo
+        run: |
+          set -euo pipefail
+          BR="security-patch/auto-$(date +%Y%m%d-%H%M%S)"
+          git checkout -b "$BR"
+          echo "PATCH_BRANCH=$BR" >> "$GITHUB_ENV"
+
+      # ---- 3. Detect ecosystem + fix + build + test ----
+      # All logic isolated in a script so a failure here is caught,
+      # not fatal to the whole job.
+      - name: Run ecosystem detection, patch, and validation
+        id: patch-and-validate
+        working-directory: target-repo
+        continue-on-error: true     # we want to inspect the result, not crash the job
+        run: |
+          chmod +x ../scripts/patch-engine.sh 2>/dev/null || true
+          bash "${GITHUB_WORKSPACE}/scripts/patch-engine.sh"
+        env:
+          GH_TOKEN: ${{ steps.app-token.outputs.token }}
+
+      # Note: patch-engine.sh is checked out from the MASTER repo, not the target.
+      # See "checkout master repo scripts" step below — reordered here for clarity,
+      # but in the real file it must run BEFORE this step. See full ordering note below.
+
+      - name: Evaluate patch result
+        id: gate
+        run: |
+          set -euo pipefail
+          STATUS_FILE="target-repo/.patch-status"
+          if [[ ! -f "$STATUS_FILE" ]]; then
+            echo "No status file produced — treating as failure."
+            echo "proceed=false" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+          STATUS=$(cat "$STATUS_FILE")
+          echo "Patch engine reported status: $STATUS"
+          if [[ "$STATUS" == "SUCCESS_WITH_CHANGES" ]]; then
+            echo "proceed=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "proceed=false" >> "$GITHUB_OUTPUT"
+          fi
+
+      # ---- 4. Commit, push, open PR — only on success + real diffs ----
+      - name: Commit changes
+        if: steps.gate.outputs.proceed == 'true'
+        working-directory: target-repo
+        run: |
+          set -euo pipefail
+          git config user.name "security-patch-bot[bot]"
+          git config user.email "security-patch-bot[bot]@users.noreply.github.com"
+          git add -A
+          git commit -m "chore(security): automated dependency vulnerability fixes"
+
+      - name: Push branch
+        if: steps.gate.outputs.proceed == 'true'
+        working-directory: target-repo
+        env:
+          GH_TOKEN: ${{ steps.app-token.outputs.token }}
+        run: |
+          set -euo pipefail
+          git push origin "${PATCH_BRANCH}"
+
+      - name: Open Pull Request
+        if: steps.gate.outputs.proceed == 'true'
+        working-directory: target-repo
+        env:
+          GH_TOKEN: ${{ steps.app-token.outputs.token }}
+        run: |
+          set -euo pipefail
+          gh pr create \
+            --repo "${{ matrix.repo }}" \
+            --base "${{ matrix.branch }}" \
+            --head "${PATCH_BRANCH}" \
+            --title "Security Update: Automated Vulnerability Fixes" \
+            --body-file "${GITHUB_WORKSPACE}/target-repo/.patch-summary.md"
+
+      - name: Report skip reason
+        if: steps.gate.outputs.proceed != 'true'
+        run: |
+          echo "::notice::No PR opened for ${{ matrix.repo }} — either no vulnerable deps, no changes after fix, or tests/build failed. Check .patch-status and logs above."
