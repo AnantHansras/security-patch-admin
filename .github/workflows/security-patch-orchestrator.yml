@@ -97,6 +97,22 @@ jobs:
       matrix: ${{ fromJson(needs.resolve-targets.outputs.matrix) }}
 
     steps:
+      - name: Split owner/repo
+        id: split-repo
+        run: |
+          set -euo pipefail
+          FULL="${{ matrix.repo }}"
+          echo "owner=${FULL%%/*}" >> "$GITHUB_OUTPUT"
+          echo "repo_name=${FULL##*/}" >> "$GITHUB_OUTPUT"
+
+      - name: Generate installation token for ${{ matrix.repo }}
+        id: app-token
+        uses: actions/create-github-app-token@v1
+        with:
+          app-id: ${{ secrets.APP_ID }}
+          private-key: ${{ secrets.APP_PRIVATE_KEY }}
+          owner: ${{ steps.split-repo.outputs.owner }}
+          repositories: ${{ steps.split-repo.outputs.repo_name }}
       # ---- 1. Mint a short-lived, repo-scoped installation token ----
       - name: Generate installation token for ${{ matrix.repo }}
         id: app-token
@@ -104,8 +120,6 @@ jobs:
         with:
           app-id: ${{ secrets.APP_ID }}
           private-key: ${{ secrets.APP_PRIVATE_KEY }}
-          owner: ${{ split(matrix.repo, '/')[0] }}
-          repositories: ${{ split(matrix.repo, '/')[1] }}
 
       # ---- 2. Clone target repo using that token ----
       - name: Checkout target repository
