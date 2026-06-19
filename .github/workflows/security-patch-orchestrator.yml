@@ -104,7 +104,8 @@ jobs:
         with:
           app-id: ${{ secrets.APP_ID }}
           private-key: ${{ secrets.APP_PRIVATE_KEY }}
-          repositories: ${{ matrix.repo }}
+          owner: ${{ split(matrix.repo, '/')[0] }}
+          repositories: ${{ split(matrix.repo, '/')[1] }}
 
       # ---- 2. Clone target repo using that token ----
       - name: Checkout target repository
