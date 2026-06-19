@@ -124,6 +124,11 @@ jobs:
           path: target-repo
           fetch-depth: 0
 
+      - name: Checkout master repo (for patch engine script)
+        uses: actions/checkout@v4
+        with:
+          path: master-repo
+
       - name: Create working branch
         working-directory: target-repo
         run: |
@@ -132,16 +137,13 @@ jobs:
           git checkout -b "$BR"
           echo "PATCH_BRANCH=$BR" >> "$GITHUB_ENV"
 
-      # ---- 3. Detect ecosystem + fix + build + test ----
-      # All logic isolated in a script so a failure here is caught,
-      # not fatal to the whole job.
       - name: Run ecosystem detection, patch, and validation
         id: patch-and-validate
         working-directory: target-repo
-        continue-on-error: true     # we want to inspect the result, not crash the job
+        continue-on-error: true
         run: |
-          chmod +x ../scripts/patch-engine.sh 2>/dev/null || true
-          bash "${GITHUB_WORKSPACE}/scripts/patch-engine.sh"
+          chmod +x "${GITHUB_WORKSPACE}/master-repo/scripts/patch-engine.sh"
+          bash "${GITHUB_WORKSPACE}/master-repo/scripts/patch-engine.sh"
         env:
           GH_TOKEN: ${{ steps.app-token.outputs.token }}
 
